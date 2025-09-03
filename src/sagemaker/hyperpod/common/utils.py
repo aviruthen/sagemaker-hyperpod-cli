@@ -16,9 +16,16 @@ from kubernetes.config import (
     KUBE_CONFIG_DEFAULT_LOCATION,
 )
 
-from .cli_decorators import _extract_namespace_from_kwargs, _is_create_operation, \
-    _pre_invoke_cli_exception_handling, _post_invoke_cli_exception_handling
-from .sdk_decorators import _pre_invoke_sdk_exception_handling, _post_invoke_sdk_exception_handling
+from .cli_decorators import (
+    _extract_namespace_from_kwargs,
+    _is_create_operation,
+    _pre_invoke_cli_exception_handling,
+    _post_invoke_cli_exception_handling,
+)
+from .sdk_decorators import (
+    _pre_invoke_sdk_exception_handling,
+    _post_invoke_sdk_exception_handling,
+)
 
 
 # Remove enum-based imports - now using template-agnostic approach
@@ -569,6 +576,11 @@ def verify_kubernetes_version_compatibility(logger) -> bool:
         logger.warning(f"Failed to verify Kubernetes version compatibility: {e}")
         return True  # Be lenient if we can't check compatibility
 
+
+# ============================================================================
+# Unified Exception Handling
+# ============================================================================
+
 def _is_cli_context() -> bool:
     """
     Detect if we're running in CLI context by checking for Click framework.
@@ -578,7 +590,7 @@ def _is_cli_context() -> bool:
     """
     try:
         click.get_current_context(silent=True)
-        return True  # Click context exists = CLI
+        return True
     except RuntimeError:
         return False
 
@@ -590,6 +602,11 @@ def handle_unified_exceptions():
     This decorator automatically detects the execution context and provides
     appropriate exception handling for both CLI and SDK usage.
     
+    For CLI commands: Uses sophisticated error handling with enhanced 404 messages,
+    namespace validation, and contextual error reporting.
+    
+    For SDK methods: Uses basic exception handling with resource context extraction.
+    
     Usage:
         @handle_unified_exceptions()
         @click.command()  # CLI usage
@@ -599,23 +616,29 @@ def handle_unified_exceptions():
         @handle_unified_exceptions()  # SDK usage
         def sdk_delete(self):
             pass
+    
+    Returns:
+        Decorator function that wraps the target function with unified exception handling
     """
-    # TODO: Implement unified decorator
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            is_cli_exception = _is_cli_context()
+            is_cli_context = _is_cli_context()
             
-            if is_cli_exception:
-                cli_namespace = _extract_namespace_from_kwargs(**kwargs)
+            if is_cli_context:
+                # CLI exception handling with enhanced features
                 is_create_operation = _is_create_operation(func)
-                _pre_invoke_cli_exception_handling(cli_namespace, is_create_operation, func, **kwargs)
+                
+                should_continue = _pre_invoke_cli_exception_handling(is_create_operation, func, **kwargs)
+                if not should_continue:
+                    return None  # Early exit due to validation failure
+                
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
-                    _post_invoke_cli_exception_handling(e, cli_namespace, is_create_operation, func, **kwargs)
-
+                    _post_invoke_cli_exception_handling(e, is_create_operation, func, **kwargs)
             else:
+                # SDK exception handling with basic features
                 _pre_invoke_sdk_exception_handling(func, *args, **kwargs)
                 try:
                     return func(*args, **kwargs)

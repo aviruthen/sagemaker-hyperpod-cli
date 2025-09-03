@@ -761,20 +761,23 @@ def _check_resources_exist(raw_resource_type: str, namespace: str) -> bool:
         logger.debug(f"Failed to check resource existence for {raw_resource_type}: {e}")
         return None
 
-def _pre_invoke_cli_exception_handling(namespace, is_create_operation, func, **kwargs):
+def _pre_invoke_cli_exception_handling(is_create_operation, func, **kwargs):
+    # Extract namespace from kwargs
+    namespace = _extract_namespace_from_kwargs(**kwargs)
+    
     # Only validate namespace proactively for non-create operations
     if not is_create_operation and namespace != 'default' and not _namespace_exists(namespace):
         namespace_error_message = _generate_namespace_error_message(namespace, func)
         click.echo(namespace_error_message)
         sys.exit(1)
-        return
+        return False  # Indicate execution should stop
     
     # Validate model-id BEFORE creation starts to avoid failed deployments
     if is_create_operation and not _validate_model_id_if_present(**kwargs):
         model_id = _extract_model_id_dynamically(**kwargs)
         click.echo(f"❌ Model ID '{model_id}' not found in JumpStart registry.")
         sys.exit(1)
-        return
+        return False  # Indicate execution should stop
     
     # Check Training Operator CRD for PyTorch job creation
     if is_create_operation and _is_pytorch_job_operation(func, **kwargs):
@@ -784,10 +787,15 @@ def _pre_invoke_cli_exception_handling(namespace, is_create_operation, func, **k
             click.echo(f"Missing Custom Resource Definition: {HYPERPOD_PYTORCH_CRD_NAME}")
             click.echo("The Training Operator is required to submit PyTorch jobs. Please install the Training Operator in your cluster.")
             sys.exit(1)
-            return
+            return False  # Indicate execution should stop
+    
+    return True  # Indicate execution should continue
 
 
-def _post_invoke_cli_exception_handling(e, namespace, is_create_operation, func, **kwargs):
+def _post_invoke_cli_exception_handling(e, is_create_operation, func, **kwargs):
+    # Extract namespace from kwargs
+    namespace = _extract_namespace_from_kwargs(**kwargs)
+    
     # 2: Enhanced Error Handling with Create Operation Namespace Check
     # For create operations, check if namespace exists when command fails
     if is_create_operation and namespace != 'default' and not _namespace_exists(namespace):
@@ -969,12 +977,15 @@ def handle_cli_exceptions():
             # Template-agnostic operation detection
             is_create_operation = _is_create_operation(func)
             
-            _pre_invoke_cli_exception_handling(namespace, is_create_operation, func, **kwargs)
+            should_continue = _pre_invoke_cli_exception_handling(is_create_operation, func, **kwargs)
+            if not should_continue:
+                return None  # Early exit due to validation failure
+            
             # Execute the command
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                _post_invoke_cli_exception_handling(e, namespace, is_create_operation, func, **kwargs)
+                _post_invoke_cli_exception_handling(e, is_create_operation, func, **kwargs)
                 
         
         return wrapper

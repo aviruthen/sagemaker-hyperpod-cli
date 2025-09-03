@@ -14,6 +14,7 @@ from sagemaker.hyperpod.common.utils import (
     get_cluster_context,
     parse_client_kubernetes_version,
     is_kubernetes_version_compatible,
+    display_formatted_logs,
 )
 from kubernetes.client.exceptions import ApiException
 from pydantic import ValidationError
@@ -408,3 +409,132 @@ class TestUtilityFunctions(unittest.TestCase):
         
         self.assertEqual(result, "arn:aws:eks:us-west-2:123456789012:cluster/my-cluster")
         mock_list_contexts.assert_called_once()
+
+
+class TestDisplayFormattedLogs(unittest.TestCase):
+    """Test the display_formatted_logs function"""
+
+    @patch('click.echo')
+    def test_display_formatted_logs_empty_logs(self, mock_echo):
+        """Test display_formatted_logs with empty logs"""
+        display_formatted_logs("", "Test Logs")
+        mock_echo.assert_called_once_with("No logs available.")
+
+    @patch('click.echo')
+    def test_display_formatted_logs_none_logs(self, mock_echo):
+        """Test display_formatted_logs with None logs"""
+        display_formatted_logs(None, "Test Logs")
+        mock_echo.assert_called_once_with("No logs available.")
+
+    @patch('click.secho')
+    @patch('click.echo')
+    def test_display_formatted_logs_error_level(self, mock_echo, mock_secho):
+        """Test display_formatted_logs with error level logs"""
+        logs = "ERROR: Something went wrong\nFATAL: Critical failure\nEXCEPTION: Unhandled exception"
+        display_formatted_logs(logs, "Error Logs")
+        
+        # Check header and footer
+        mock_echo.assert_any_call("\nError Logs:")
+        mock_echo.assert_any_call("=" * 80)
+        mock_echo.assert_any_call("\nEnd of logs")
+        mock_echo.assert_any_call("=" * 80)
+        
+        # Check error lines are colored red
+        mock_secho.assert_any_call("ERROR: Something went wrong", fg="red")
+        mock_secho.assert_any_call("FATAL: Critical failure", fg="red")
+        mock_secho.assert_any_call("EXCEPTION: Unhandled exception", fg="red")
+
+    @patch('click.secho')
+    @patch('click.echo')
+    def test_display_formatted_logs_warning_level(self, mock_echo, mock_secho):
+        """Test display_formatted_logs with warning level logs"""
+        logs = "WARNING: This is a warning\nWARN: Another warning"
+        display_formatted_logs(logs)
+        
+        # Check warning lines are colored yellow
+        mock_secho.assert_any_call("WARNING: This is a warning", fg="yellow")
+        mock_secho.assert_any_call("WARN: Another warning", fg="yellow")
+
+    @patch('click.secho')
+    @patch('click.echo')
+    def test_display_formatted_logs_info_level(self, mock_echo, mock_secho):
+        """Test display_formatted_logs with info level logs"""
+        logs = "INFO: Status message\nSUCCESS: Operation completed"
+        display_formatted_logs(logs)
+        
+        # Check info lines are colored green
+        mock_secho.assert_any_call("INFO: Status message", fg="green")
+        mock_secho.assert_any_call("SUCCESS: Operation completed", fg="green")
+
+    @patch('click.secho')
+    @patch('click.echo')
+    def test_display_formatted_logs_debug_level(self, mock_echo, mock_secho):
+        """Test display_formatted_logs with debug level logs"""
+        logs = "DEBUG: Debug message\nTRACE: Trace message"
+        display_formatted_logs(logs)
+        
+        # Check debug lines are colored blue
+        mock_secho.assert_any_call("DEBUG: Debug message", fg="blue")
+        mock_secho.assert_any_call("TRACE: Trace message", fg="blue")
+
+    @patch('click.echo')
+    def test_display_formatted_logs_plain_text(self, mock_echo):
+        """Test display_formatted_logs with plain text logs"""
+        logs = "This is plain text\nAnother plain line"
+        display_formatted_logs(logs)
+        
+        # Check plain lines use regular echo
+        mock_echo.assert_any_call("This is plain text")
+        mock_echo.assert_any_call("Another plain line")
+
+    @patch('click.secho')
+    @patch('click.echo')
+    def test_display_formatted_logs_mixed_levels(self, mock_echo, mock_secho):
+        """Test display_formatted_logs with mixed log levels"""
+        logs = "INFO: Starting process\nERROR: Failed to connect\nPlain text line\nWARNING: Retrying connection"
+        display_formatted_logs(logs, "Mixed Logs")
+        
+        # Check header
+        mock_echo.assert_any_call("\nMixed Logs:")
+        
+        # Check different colored lines
+        mock_secho.assert_any_call("INFO: Starting process", fg="green")
+        mock_secho.assert_any_call("ERROR: Failed to connect", fg="red")
+        mock_secho.assert_any_call("WARNING: Retrying connection", fg="yellow")
+        mock_echo.assert_any_call("Plain text line")
+
+    @patch('click.echo')
+    def test_display_formatted_logs_empty_lines_skipped(self, mock_echo):
+        """Test display_formatted_logs skips empty lines"""
+        logs = "Line 1\n\n\nLine 2\n\n"
+        display_formatted_logs(logs)
+        
+        # Should only echo non-empty lines plus headers/footers
+        mock_echo.assert_any_call("Line 1")
+        mock_echo.assert_any_call("Line 2")
+        # Empty lines should not be echoed
+        mock_echo.assert_any_call("\nLogs:")
+        mock_echo.assert_any_call("=" * 80)
+        mock_echo.assert_any_call("\nEnd of logs")
+        mock_echo.assert_any_call("=" * 80)
+
+    @patch('click.echo')
+    def test_display_formatted_logs_default_title(self, mock_echo):
+        """Test display_formatted_logs uses default title when not specified"""
+        logs = "Test log line"
+        display_formatted_logs(logs)
+        
+        # Should use default title "Logs"
+        mock_echo.assert_any_call("\nLogs:")
+
+    @patch('click.secho')
+    @patch('click.echo')
+    def test_display_formatted_logs_case_insensitive(self, mock_echo, mock_secho):
+        """Test display_formatted_logs is case insensitive for log levels"""
+        logs = "error: lowercase error\nWarning: mixed case warning\nINFO: uppercase info"
+        display_formatted_logs(logs)
+        
+        # Check case insensitive matching
+        mock_secho.assert_any_call("error: lowercase error", fg="red")
+        mock_secho.assert_any_call("Warning: mixed case warning", fg="yellow")
+        mock_secho.assert_any_call("INFO: uppercase info", fg="green")
