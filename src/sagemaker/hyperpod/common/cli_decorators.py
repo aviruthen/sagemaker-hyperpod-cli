@@ -761,6 +761,184 @@ def _check_resources_exist(raw_resource_type: str, namespace: str) -> bool:
         logger.debug(f"Failed to check resource existence for {raw_resource_type}: {e}")
         return None
 
+def _pre_invoke_cli_exception_handling(namespace, is_create_operation, func, **kwargs):
+    # Only validate namespace proactively for non-create operations
+    if not is_create_operation and namespace != 'default' and not _namespace_exists(namespace):
+        namespace_error_message = _generate_namespace_error_message(namespace, func)
+        click.echo(namespace_error_message)
+        sys.exit(1)
+        return
+    
+    # Validate model-id BEFORE creation starts to avoid failed deployments
+    if is_create_operation and not _validate_model_id_if_present(**kwargs):
+        model_id = _extract_model_id_dynamically(**kwargs)
+        click.echo(f"❌ Model ID '{model_id}' not found in JumpStart registry.")
+        sys.exit(1)
+        return
+    
+    # Check Training Operator CRD for PyTorch job creation
+    if is_create_operation and _is_pytorch_job_operation(func, **kwargs):
+        if not _check_training_operator_exists():
+            from sagemaker.hyperpod.cli.constants.pytorch_constants import HYPERPOD_PYTORCH_CRD_NAME
+            click.echo("❌ Training Operator not found in cluster.")
+            click.echo(f"Missing Custom Resource Definition: {HYPERPOD_PYTORCH_CRD_NAME}")
+            click.echo("The Training Operator is required to submit PyTorch jobs. Please install the Training Operator in your cluster.")
+            sys.exit(1)
+            return
+
+
+def _post_invoke_cli_exception_handling(e, namespace, is_create_operation, func, **kwargs):
+    # 2: Enhanced Error Handling with Create Operation Namespace Check
+    # For create operations, check if namespace exists when command fails
+    if is_create_operation and namespace != 'default' and not _namespace_exists(namespace):
+        namespace_error_message = _generate_namespace_error_message(namespace, func)
+        click.echo(namespace_error_message)
+        sys.exit(1)
+        return
+    
+    # 3: Enhanced 404 Resource Handling with Dynamic Target Detection
+    # Check if this is a 404 error that can benefit from enhanced handling
+    if isinstance(e, ApiException) and e.status == 404:
+        # Dynamically determine what the command is targeting
+        target_type, target_name = _extract_primary_target_dynamically(**kwargs)
+        namespace = kwargs.get('namespace', 'default')
+        
+        # Dynamically detect resource type
+        raw_resource_type, display_name = _extract_resource_from_command(func)
+        
+        try:
+            # Generate context-aware error message based on target type
+            if target_type == 'pod':
+                # Pod-focused error - no need to check resource existence
+                enhanced_message = _generate_context_aware_error_message(
+                    target_type, target_name, display_name, namespace, raw_resource_type
+                )
+            else:
+                # Resource-focused error - check resource existence for better context
+                resources_exist = _check_resources_exist(raw_resource_type, namespace)
+                enhanced_message = _generate_context_aware_error_message(
+                    target_type, target_name, display_name, namespace, raw_resource_type, resources_exist
+                )
+            
+            click.echo(enhanced_message)
+            sys.exit(1)
+            return  # Prevent fallback execution in tests
+            
+        except Exception:
+            # Fallback to basic message (no ❓ emoji for fallback)
+            fallback_message = (
+                f"{display_name} '{target_name}' not found in namespace '{namespace}'. "
+                f"Please check the resource name and namespace."
+            )
+            click.echo(fallback_message)
+            sys.exit(1)
+            return  # Prevent fallback execution in tests
+    
+    # Check if this might be a wrapped 404 in a regular Exception
+    elif "404" in str(e) or "not found" in str(e).lower():
+        # First check if this is a "pod not found in job" scenario
+        if _is_pod_not_found_in_job_scenario(str(e), func=func, **kwargs):
+            try:
+                # Extract pod name and job name from context
+                pod_name = None
+                job_name = None
+                
+                click_ctx = click.get_current_context(silent=True)
+                if click_ctx and click_ctx.params:
+                    pod_name = click_ctx.params.get('pod_name')
+                    job_name = click_ctx.params.get('job_name') or click_ctx.params.get('name')
+                
+                # Fallback to kwargs
+                if not pod_name:
+                    pod_name = kwargs.get('pod_name')
+                if not job_name:
+                    job_name = kwargs.get('job_name') or kwargs.get('name')
+                
+                if pod_name and job_name:
+                    enhanced_message = _generate_pod_not_found_message(pod_name, job_name)
+                    click.echo(enhanced_message)
+                    sys.exit(1)
+                    return
+            except Exception:
+                # Fall through to normal 404 handling if pod validation fails
+                pass
+        
+        # Use dynamic target detection for wrapped 404s as well
+        target_type, target_name = _extract_primary_target_dynamically(**kwargs)
+        namespace = kwargs.get('namespace', 'default')
+        
+        # Dynamically detect resource type
+        raw_resource_type, display_name = _extract_resource_from_command(func)
+        
+        try:
+            # Generate context-aware error message based on target type
+            if target_type == 'pod':
+                # Pod-focused error - no need to check resource existence
+                enhanced_message = _generate_context_aware_error_message(
+                    target_type, target_name, display_name, namespace, raw_resource_type
+                )
+            else:
+                # Resource-focused error - check resource existence for better context
+                resources_exist = _check_resources_exist(raw_resource_type, namespace)
+                enhanced_message = _generate_context_aware_error_message(
+                    target_type, target_name, display_name, namespace, raw_resource_type, resources_exist
+                )
+            
+            click.echo(enhanced_message)
+            sys.exit(1)
+            return  # Prevent fallback execution in tests
+            
+        except Exception:
+            # Fall through to standard handling
+            pass
+    
+    # 4: Container Error Handling for 400 Bad Request
+    # Check if this is a 400 Bad Request with invalid container parameter (check this FIRST)
+    elif "400" in str(e) and "Bad Request" in str(e) and _has_container_parameter(**kwargs):
+        try:
+            pod_name = _extract_primary_target_dynamically(**kwargs)[1]  # Get pod name
+            container_name = _extract_container_name_dynamically(**kwargs)
+            namespace = kwargs.get('namespace', 'default')
+            
+            available_containers = _get_available_containers(pod_name, namespace)
+            if available_containers:
+                click.echo(f"❌ Container '{container_name}' not found in pod '{pod_name}'.")
+                click.echo(f"Available containers: {available_containers}")
+                # Generate helpful command suggestion
+                raw_resource_type, _ = _extract_resource_from_command(func)
+                suggested_container = available_containers[0].replace(' (init)', '')  # Remove init marker for command
+                click.echo(f"Use: hyp get-logs hyp-{raw_resource_type} --pod-name {pod_name} --container {suggested_container}")
+            else:
+                click.echo(f"❌ Container '{container_name}' not found in pod '{pod_name}'.")
+            
+            sys.exit(1)
+            return
+            
+        except Exception:
+            # Fall through to standard handling if container validation fails
+            pass
+    
+    # 5: Enhanced Pod Readiness Error Handling for get-logs 400 Bad Request
+    # Check if this is a 400 Bad Request from get-logs on pod that's not ready
+    elif "400" in str(e) and "Bad Request" in str(e) and _is_get_logs_operation(func, **kwargs):
+        try:
+            pod_name = _extract_primary_target_dynamically(**kwargs)[1]  # Get pod name
+            namespace = _extract_namespace_from_kwargs(**kwargs)
+            
+            enhanced_message = _check_pod_readiness_and_generate_message(pod_name, namespace)
+            click.echo(enhanced_message)
+            sys.exit(1)
+            return
+            
+        except Exception:
+            # Fall through to standard handling if pod readiness check fails
+            pass
+    
+    # For all other errors, use standard handling 
+    click.echo(str(e))
+    sys.exit(1)
+
+
 def handle_cli_exceptions():
     """
     Template-agnostic decorator with proactive namespace validation and enhanced error handling.
@@ -787,188 +965,17 @@ def handle_cli_exceptions():
             # Only validate namespace proactively for operations where it's the PRIMARY concern
             # Skip for create operations where parameter validation should come first
             namespace = _extract_namespace_from_kwargs(**kwargs)
-            
+
             # Template-agnostic operation detection
             is_create_operation = _is_create_operation(func)
             
-            # Only validate namespace proactively for non-create operations
-            if not is_create_operation and namespace != 'default' and not _namespace_exists(namespace):
-                namespace_error_message = _generate_namespace_error_message(namespace, func)
-                click.echo(namespace_error_message)
-                sys.exit(1)
-                return
-            
-            # Validate model-id BEFORE creation starts to avoid failed deployments
-            if is_create_operation and not _validate_model_id_if_present(**kwargs):
-                model_id = _extract_model_id_dynamically(**kwargs)
-                click.echo(f"❌ Model ID '{model_id}' not found in JumpStart registry.")
-                sys.exit(1)
-                return
-            
-            # Check Training Operator CRD for PyTorch job creation
-            if is_create_operation and _is_pytorch_job_operation(func, **kwargs):
-                if not _check_training_operator_exists():
-                    from sagemaker.hyperpod.cli.constants.pytorch_constants import HYPERPOD_PYTORCH_CRD_NAME
-                    click.echo("❌ Training Operator not found in cluster.")
-                    click.echo(f"Missing Custom Resource Definition: {HYPERPOD_PYTORCH_CRD_NAME}")
-                    click.echo("The Training Operator is required to submit PyTorch jobs. Please install the Training Operator in your cluster.")
-                    sys.exit(1)
-                    return
-            
+            _pre_invoke_cli_exception_handling(namespace, is_create_operation, func, **kwargs)
             # Execute the command
             try:
                 return func(*args, **kwargs)
             except Exception as e:
+                _post_invoke_cli_exception_handling(e, namespace, is_create_operation, func, **kwargs)
                 
-                # 2: Enhanced Error Handling with Create Operation Namespace Check
-                # For create operations, check if namespace exists when command fails
-                if is_create_operation and namespace != 'default' and not _namespace_exists(namespace):
-                    namespace_error_message = _generate_namespace_error_message(namespace, func)
-                    click.echo(namespace_error_message)
-                    sys.exit(1)
-                    return
-                
-                # 3: Enhanced 404 Resource Handling with Dynamic Target Detection
-                # Check if this is a 404 error that can benefit from enhanced handling
-                if isinstance(e, ApiException) and e.status == 404:
-                    # Dynamically determine what the command is targeting
-                    target_type, target_name = _extract_primary_target_dynamically(**kwargs)
-                    namespace = kwargs.get('namespace', 'default')
-                    
-                    # Dynamically detect resource type
-                    raw_resource_type, display_name = _extract_resource_from_command(func)
-                    
-                    try:
-                        # Generate context-aware error message based on target type
-                        if target_type == 'pod':
-                            # Pod-focused error - no need to check resource existence
-                            enhanced_message = _generate_context_aware_error_message(
-                                target_type, target_name, display_name, namespace, raw_resource_type
-                            )
-                        else:
-                            # Resource-focused error - check resource existence for better context
-                            resources_exist = _check_resources_exist(raw_resource_type, namespace)
-                            enhanced_message = _generate_context_aware_error_message(
-                                target_type, target_name, display_name, namespace, raw_resource_type, resources_exist
-                            )
-                        
-                        click.echo(enhanced_message)
-                        sys.exit(1)
-                        return  # Prevent fallback execution in tests
-                        
-                    except Exception:
-                        # Fallback to basic message (no ❓ emoji for fallback)
-                        fallback_message = (
-                            f"{display_name} '{target_name}' not found in namespace '{namespace}'. "
-                            f"Please check the resource name and namespace."
-                        )
-                        click.echo(fallback_message)
-                        sys.exit(1)
-                        return  # Prevent fallback execution in tests
-                
-                # Check if this might be a wrapped 404 in a regular Exception
-                elif "404" in str(e) or "not found" in str(e).lower():
-                    # First check if this is a "pod not found in job" scenario
-                    if _is_pod_not_found_in_job_scenario(str(e), func=func, **kwargs):
-                        try:
-                            # Extract pod name and job name from context
-                            pod_name = None
-                            job_name = None
-                            
-                            click_ctx = click.get_current_context(silent=True)
-                            if click_ctx and click_ctx.params:
-                                pod_name = click_ctx.params.get('pod_name')
-                                job_name = click_ctx.params.get('job_name') or click_ctx.params.get('name')
-                            
-                            # Fallback to kwargs
-                            if not pod_name:
-                                pod_name = kwargs.get('pod_name')
-                            if not job_name:
-                                job_name = kwargs.get('job_name') or kwargs.get('name')
-                            
-                            if pod_name and job_name:
-                                enhanced_message = _generate_pod_not_found_message(pod_name, job_name)
-                                click.echo(enhanced_message)
-                                sys.exit(1)
-                                return
-                        except Exception:
-                            # Fall through to normal 404 handling if pod validation fails
-                            pass
-                    
-                    # Use dynamic target detection for wrapped 404s as well
-                    target_type, target_name = _extract_primary_target_dynamically(**kwargs)
-                    namespace = kwargs.get('namespace', 'default')
-                    
-                    # Dynamically detect resource type
-                    raw_resource_type, display_name = _extract_resource_from_command(func)
-                    
-                    try:
-                        # Generate context-aware error message based on target type
-                        if target_type == 'pod':
-                            # Pod-focused error - no need to check resource existence
-                            enhanced_message = _generate_context_aware_error_message(
-                                target_type, target_name, display_name, namespace, raw_resource_type
-                            )
-                        else:
-                            # Resource-focused error - check resource existence for better context
-                            resources_exist = _check_resources_exist(raw_resource_type, namespace)
-                            enhanced_message = _generate_context_aware_error_message(
-                                target_type, target_name, display_name, namespace, raw_resource_type, resources_exist
-                            )
-                        
-                        click.echo(enhanced_message)
-                        sys.exit(1)
-                        return  # Prevent fallback execution in tests
-                        
-                    except Exception:
-                        # Fall through to standard handling
-                        pass
-                
-                # 4: Container Error Handling for 400 Bad Request
-                # Check if this is a 400 Bad Request with invalid container parameter (check this FIRST)
-                elif "400" in str(e) and "Bad Request" in str(e) and _has_container_parameter(**kwargs):
-                    try:
-                        pod_name = _extract_primary_target_dynamically(**kwargs)[1]  # Get pod name
-                        container_name = _extract_container_name_dynamically(**kwargs)
-                        namespace = kwargs.get('namespace', 'default')
-                        
-                        available_containers = _get_available_containers(pod_name, namespace)
-                        if available_containers:
-                            click.echo(f"❌ Container '{container_name}' not found in pod '{pod_name}'.")
-                            click.echo(f"Available containers: {available_containers}")
-                            # Generate helpful command suggestion
-                            raw_resource_type, _ = _extract_resource_from_command(func)
-                            suggested_container = available_containers[0].replace(' (init)', '')  # Remove init marker for command
-                            click.echo(f"Use: hyp get-logs hyp-{raw_resource_type} --pod-name {pod_name} --container {suggested_container}")
-                        else:
-                            click.echo(f"❌ Container '{container_name}' not found in pod '{pod_name}'.")
-                        
-                        sys.exit(1)
-                        return
-                        
-                    except Exception:
-                        # Fall through to standard handling if container validation fails
-                        pass
-                
-                # 5: Enhanced Pod Readiness Error Handling for get-logs 400 Bad Request
-                # Check if this is a 400 Bad Request from get-logs on pod that's not ready
-                elif "400" in str(e) and "Bad Request" in str(e) and _is_get_logs_operation(func, **kwargs):
-                    try:
-                        pod_name = _extract_primary_target_dynamically(**kwargs)[1]  # Get pod name
-                        namespace = _extract_namespace_from_kwargs(**kwargs)
-                        
-                        enhanced_message = _check_pod_readiness_and_generate_message(pod_name, namespace)
-                        click.echo(enhanced_message)
-                        sys.exit(1)
-                        return
-                        
-                    except Exception:
-                        # Fall through to standard handling if pod readiness check fails
-                        pass
-                
-                # For all other errors, use standard handling 
-                click.echo(str(e))
-                sys.exit(1)
         
         return wrapper
     return decorator

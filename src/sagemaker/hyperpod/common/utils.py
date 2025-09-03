@@ -7,6 +7,7 @@ import boto3
 import json
 from typing import List, Tuple, Optional
 import logging
+import functools
 import os
 import subprocess
 import yaml
@@ -14,6 +15,12 @@ import click
 from kubernetes.config import (
     KUBE_CONFIG_DEFAULT_LOCATION,
 )
+
+from .cli_decorators import _extract_namespace_from_kwargs, _is_create_operation, \
+    _pre_invoke_cli_exception_handling, _post_invoke_cli_exception_handling
+from .sdk_decorators import _pre_invoke_sdk_exception_handling, _post_invoke_sdk_exception_handling
+
+
 # Remove enum-based imports - now using template-agnostic approach
 
 EKS_ARN_PATTERN = r"arn:aws:eks:([\w-]+):\d+:cluster/([\w-]+)"
@@ -561,3 +568,59 @@ def verify_kubernetes_version_compatibility(logger) -> bool:
     except Exception as e:
         logger.warning(f"Failed to verify Kubernetes version compatibility: {e}")
         return True  # Be lenient if we can't check compatibility
+
+def _is_cli_context() -> bool:
+    """
+    Detect if we're running in CLI context by checking for Click framework.
+    
+    Returns:
+        bool: True if CLI context (Click available), False if SDK context
+    """
+    try:
+        click.get_current_context(silent=True)
+        return True  # Click context exists = CLI
+    except RuntimeError:
+        return False
+
+
+def handle_unified_exceptions():
+    """
+    Unified decorator that works for both CLI commands and SDK methods.
+    
+    This decorator automatically detects the execution context and provides
+    appropriate exception handling for both CLI and SDK usage.
+    
+    Usage:
+        @handle_unified_exceptions()
+        @click.command()  # CLI usage
+        def cli_delete():
+            pass
+            
+        @handle_unified_exceptions()  # SDK usage
+        def sdk_delete(self):
+            pass
+    """
+    # TODO: Implement unified decorator
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            is_cli_exception = _is_cli_context()
+            
+            if is_cli_exception:
+                cli_namespace = _extract_namespace_from_kwargs(**kwargs)
+                is_create_operation = _is_create_operation(func)
+                _pre_invoke_cli_exception_handling(cli_namespace, is_create_operation, func, **kwargs)
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    _post_invoke_cli_exception_handling(e, cli_namespace, is_create_operation, func, **kwargs)
+
+            else:
+                _pre_invoke_sdk_exception_handling(func, *args, **kwargs)
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    _post_invoke_sdk_exception_handling(e, func, *args, **kwargs)
+
+        return wrapper
+    return decorator
